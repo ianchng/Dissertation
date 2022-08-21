@@ -1,0 +1,1982 @@
+---
+title: "DissertationCodeOrganised"
+output: html_document
+---
+
+# Part I: Reading in packages and base maps
+
+### Reading in required packages
+
+```{r load_packages}
+library(spatstat)
+library(here)
+library(sp)
+library(rgeos)
+library(maptools)
+library(GISTools)
+library(tmap)
+library(sf)
+library(geojson)
+library(geojsonio)
+library(tmaptools)
+library(janitor)
+library(stringr)
+library(tidyverse)
+library(readr)
+library(tmap)
+library(tmaptools)
+library(raster)
+library(fpc)
+library(dbscan)
+library(ggplot2)
+library(spdep)
+
+library(geojsonio)
+library(plotly)
+library(rgdal)
+library(broom)
+library(crosstalk)
+library(car)
+library(fs)
+library(corrr)
+library(spgwr)
+library(readxl)
+library(classInt)
+library(feather)
+library(arrow)
+library(reshape2)
+
+```
+
+### Read in PDR development data
+
+```{r read_in_excel_data}
+
+PDRDvpRaw <- read_excel(here::here("Data", "Prior_approvals_for_analysis_20211215.xlsx"),
+                     na=c("NA", "n/a"))
+
+```
+
+### Read in shapefiles
+
+```{r London_MSOA_shapefile}
+
+# data from ONS
+LondonMSOA <- st_read(here::here("Data", "statistical-gis-boundaries-london", 
+                                 "Middle_Layer_Super_Output_Areas_(December_2011)_Boundaries_Generalised_Clipped_(BGC)_EW_V3",
+                                 "Middle_Layer_Super_Output_Areas_(December_2011)_Boundaries_Generalised_Clipped_(BGC)_EW_V3.shp")) %>%
+  clean_names() %>%
+  st_transform(.,27700) %>%
+  # change to data frame for join
+  as_data_frame() %>%
+  dplyr::select(msoa11cd,
+                geometry)
+
+# reference layer with information about London MSOAs
+LondonMSOARef <- st_read(here::here("Data", "statistical-gis-boundaries-london",
+                                    "ESRI", "MSOA_2011_London_gen_MHW.shp")) %>%
+  clean_names() %>%
+  st_transform(.,27700) %>%
+  as_data_frame() %>%
+  dplyr::select(msoa11cd, msoa11nm, lad11cd, lad11nm, rgn11cd, rgn11nm)
+
+LondonMSOA <- LondonMSOARef %>%
+  left_join(., 
+            LondonMSOA,
+            by = c("msoa11cd"="msoa11cd")) %>%
+  st_as_sf() %>%
+  st_transform(.,27700)
+
+qtm(LondonMSOA)
+
+```
+
+```{r London_borough_shapefile}
+
+LondonBorough <- st_read(here::here("Data", "statistical-gis-boundaries-london", 
+                                 "ESRI", "London_Borough_Excluding_MHW.shp")) %>%
+  clean_names() %>%
+  st_transform(.,27700)
+
+qtm(LondonBorough)
+
+```
+
+### Data cleaning & wrangling
+
+```{r data_cleaning_wrangling}
+
+PDRConversionsConsidered <- c("Prior Approval: Change of use - offices to dwellinghouses", 
+                              "Prior Approval: Change of use - retail/takeaway to dwellinghouses", 
+                              "Prior Approval: Change of use - light industrial to dwellinghouses")
+
+PDRDvp <- PDRDvpRaw %>%
+  # clean names
+  clean_names() %>%
+  # select types of conversions you want
+  dplyr::filter(application_type_on_datahub %in% PDRConversionsConsidered) %>%
+  dplyr::filter(status == "Completed") %>%
+  dplyr::select(id,
+                application_type_assumed,
+                development_description,
+                easting,
+                northing,
+                postcode,
+                planning_authority,
+                application_number,
+                decision_date,
+                residential_units_proposed,
+                existing_use_class_from_datahub,
+                existing_non_residential_floorspace) %>%
+  # remove entries that do not have coordinate data - this drops entries from 2645 to 2637
+  drop_na(easting)
+
+```
+
+# Part II: Summary Statistics
+
+```{r histograms}
+
+# histogram for entire PDR distribution
+
+PDRUnitDist <- ggplot(PDRDvp,
+                      aes(x=residential_units_proposed)) +
+  geom_histogram(binwidth=5, fill="#4c9b82", color="#434343", alpha=0.9) +
+  labs(title="distribution of PDR developments by units delivered",
+       x="number of units",
+       y="frequency")
+
+PDRUnitDist
+
+
+# zoomed-in histogram for developments delivering 50 units and over
+
+PDRUnitDistZoomed <- ggplot(PDRDvp,
+                            aes(x=residential_units_proposed)) +
+  geom_histogram(binwidth=5, fill="#4c9b82", color="#434343", alpha=0.9) +
+  labs(title="distribution of PDR developments by units delivered",
+       x="number of units",
+       y="frequency") +
+  xlim(50,450) +
+  ylim(0,50)
+
+PDRUnitDistZoomed
+
+```
+Place zoomed in range of 50-450 as an inset.
+"insets show a zoom-in on the low upper range of units developed by PDR developments"
+
+```{r box_and_whisker}
+
+# box and whisker plot for all PDR developments
+
+PDRDvpBoxplot <- ggplot(PDRDvp, aes(x=residential_units_proposed)) +
+  scale_color_manual(values = "#434343") +
+  geom_boxplot(fill="#4c9b82", width = 0.5) +
+  ylim(-1,1)
+
+PDRDvpBoxplot
+
+
+# inset box and whisker - zoomed-in
+
+PDRDvpBoxplotZoomed <- ggplot(PDRDvp, aes(x=residential_units_proposed)) +
+  scale_color_manual(values = "#434343") +
+  geom_boxplot(fill="#4c9b82", width = 0.5) +
+  xlim(0,25) +
+  ylim(-1,1)
+
+PDRDvpBoxplotZoomed
+
+```
+
+# Part III: Splitting the data - small and large PDR developments
+
+From the data above, we would classify a small PDR development as one that delivers 10 units or less. Conversely, a large PDR development will comprise of PDR developments that deliver 11 units and above.
+
+```{r plot_all_PDR_point_data}
+
+# changing dataset to sf so you can set CRS and convert eastings and northings to coordinate data - get point data
+PDRDvpSF <- st_as_sf(PDRDvp, coords=c("easting", "northing"),
+                     crs=27700)
+
+# remove duplicate points - 2645 reduced to 2507 points
+PDRDvpSF <- PDRDvpSF %>%
+  distinct(geometry, .keep_all = T)
+
+#include only points within boundary by performing a spatial subset
+PDRPoints <- PDRDvpSF[LondonMSOA,]
+
+#plot to see
+tmap_mode("plot")
+
+tm_shape(LondonMSOA) +
+  tm_polygons(col=NA, alpha=0.5) +
+tm_shape(PDRPoints) +
+  tm_dots(col = "orange")
+
+```
+
+```{r plotting_small_and_large_PDR_projects}
+
+# isolate small PDR developments (less than 10 units)
+
+PDRPoints_SMALL <- PDRPoints %>%
+  dplyr::filter(residential_units_proposed<11 & residential_units_proposed>0)
+
+#plot to see
+
+tmap_mode("plot")
+
+tm_shape(LondonMSOA) +
+  tm_polygons(col=NA, alpha=0.5) +
+tm_shape(PDRPoints_SMALL) +
+  tm_dots(col = "green")
+
+# isolate large PDR developments (over 10 units)
+
+PDRPoints_LARGE <- PDRPoints %>%
+  dplyr::filter(residential_units_proposed>10)
+
+#plot to see
+
+tmap_mode("plot")
+
+tm_shape(LondonMSOA) +
+  tm_polygons(col=NA, alpha=0.5) +
+tm_shape(PDRPoints_LARGE) +
+  tm_dots(col = "blue")
+
+```
+Small PDR developments - 2090
+Large PDR developments - 414
+
+# Part IV: Analysing Spatial Extent and Distribution of PDR
+
+```{r select_bandwidth}
+PDRPointsPPP_SMALL %>%
+  density(., bw="SJ", adjust=1) %>%
+  plot()
+
+```
+
+```{r Kernal_Density_Estimation}
+
+# SMALL PDR developments
+# create a window for spatstat to analyse
+window <- as.owin(LondonBorough)
+plot(window)
+
+# create sp object
+PDRPointsSP_SMALL <- PDRPoints_SMALL %>%
+  as(.,"Spatial")
+
+# create ppp object
+PDRPointsPPP_SMALL <- ppp(x=PDRPointsSP_SMALL@coords[,1],
+                          y=PDRPointsSP_SMALL@coords[,2],
+                          window=window)
+
+# KDE
+PDRPointsPPP_SMALL %>%
+  density(.,sigma=1000) %>%
+  plot()
+
+
+# LARGE PDR developments
+# create a window for spatstat to analyse
+window <- as.owin(LondonBorough)
+plot(window)
+
+# create sp object
+PDRPointsSP_LARGE <- PDRPoints_LARGE %>%
+  as(.,"Spatial")
+
+# create ppp object
+PDRPointsPPP_LARGE <- ppp(x=PDRPointsSP_LARGE@coords[,1],
+                          y=PDRPointsSP_LARGE@coords[,2],
+                          window=window)
+
+# KDE
+PDRPointsPPP_LARGE %>%
+  density(.,sigma=1000) %>%
+  plot()
+```
+
+```{r aggregating_PDR_points_to_MSOAs}
+
+# analyse distribution of SMALL PDR developments
+
+# overlay points over MSOA and count them
+SmallPDRDvpSFJoined <- LondonMSOA %>%
+  st_join(PDRPoints_SMALL) %>%
+  # remove na values - basically removes MSOAs with 0 PDR development as well
+  na.omit() %>%
+  add_count(msoa11cd) %>%
+  mutate(area=st_area(.)) %>%
+  mutate(density=n/area) %>%
+  dplyr::select(msoa11cd, msoa11nm, lad11nm, geometry, density, n, residential_units_proposed)
+
+# summarise the data
+SmallPDR_sf_summarise <- SmallPDRDvpSFJoined %>%
+  group_by(msoa11cd) %>%
+  summarise(density=first(density),
+            msoa11cd=first(msoa11cd),
+            n=first(n)) %>%
+  # change back to dataframe so that you can join later
+  as.data.frame()
+
+# join back the MSOAs that have been dropped, then convert the object back to sf
+SmallPDR_sf_summarise <- LondonMSOA %>%
+  left_join(.,
+            SmallPDR_sf_summarise,
+            by = c("msoa11cd" = "msoa11cd")) %>%
+  st_as_sf() %>%
+  dplyr::select(msoa11cd, msoa11nm, lad11nm, geometry.x, n) %>%
+  dplyr::rename(geometry = geometry.x)
+
+# assign MSOAs that have no PDRs as 0  
+SmallPDR_sf_summarise[is.na(SmallPDR_sf_summarise)] <- 0
+
+# use jenks natural breaks to find good range of breaks
+SMALLPDRClass <- classIntervals(SmallPDR_sf_summarise$n, n=6, style="jenks")
+
+SMALLPDRClass$brks
+
+# breaks are as follows 0 1 3 6 11 19 29
+
+
+
+# plot the data - should we normalise or keep absolute number?
+tmap_mode("plot")
+
+Breaks_NumPDR <- c(0,1,3,6,11,19,29)
+Labels_NumPDR <- c("0","1-3","3-6", "6-11", "11-19", "19-29")
+Palette_NumPDR <- c("#bfbfbf", "#d3f2a3", "#97e196", "#4c9b82", "#105965", "#074050")
+
+tm_shape(SmallPDR_sf_summarise) +
+    tm_polygons("n",
+        breaks=Breaks_NumPDR,
+        labels=Labels_NumPDR,
+        palette=Palette_NumPDR,
+        border.col = "#ECEFF1",
+        border.alpha = 0.2,
+        style="fixed",
+        midpoint=NA,
+        popup.vars=c("msoa11nm", "density"),
+        title="Number of small PDR developments in each MSOA") + 
+  tm_legend(show=TRUE) +
+  #tm_layout(legend.only = TRUE) +
+tm_shape(LondonBorough) +
+  tm_polygons(col=NA,
+              alpha = 0,
+              border.col = "#434343",
+              border.alpha = 0.8,
+              zindex = 2)
+
+
+#f7feae,#b7e6a5,#7ccba2,#46aea0,#089099,#00718b,#045275
+#("#bfbfbf", "#f7feae", "#b7e6a5", "#7ccba2", "#089099", "#045275")
+
+#d3f2a3,#97e196,#6cc08b,#4c9b82,#217a79,#105965,#074050
+#("#bfbfbf", "#d3f2a3", "#97e196", "#4c9b82", "#105965", "#074050")
+
+
+
+# analyse distribution of LARGE PDR developments
+
+# overlay points over MSOA and count them
+LargePDRDvpSFJoined <- LondonMSOA %>%
+  st_join(PDRPoints_LARGE) %>%
+  # remove na values
+  na.omit() %>%
+  add_count(msoa11cd) %>%
+  mutate(area=st_area(.)) %>%
+  mutate(density=n/area) %>%
+  dplyr::select(msoa11cd, msoa11nm, lad11nm, geometry, density, n, residential_units_proposed)
+
+# summarise the data
+LargePDR_sf_summarise <- LargePDRDvpSFJoined %>%
+  group_by(msoa11cd) %>%
+  summarise(density=first(density),
+            msoa11cd=first(msoa11cd),
+            n=first(n)) %>%
+  # change back to dataframe so that you can join later
+  as.data.frame()
+
+# join back the MSOAs that have been dropped, then convert the object back to sf
+LargePDR_sf_summarise <- LondonMSOA %>%
+  left_join(.,
+            LargePDR_sf_summarise,
+            by = c("msoa11cd" = "msoa11cd")) %>%
+  st_as_sf() %>%
+  dplyr::select(msoa11cd, msoa11nm, lad11nm, geometry.x, n) %>%
+  dplyr::rename(geometry = geometry.x)
+  
+LargePDR_sf_summarise[is.na(LargePDR_sf_summarise)] <- 0
+
+# plot the data - should we normalise or keep absolute number?
+tmap_mode("plot")
+
+Breaks_NumPDR <- c(0,1,3,6,11,19,29)
+Labels_NumPDR <- c("0","1-3","3-6", "6-11", "11-19", "19-29")
+Palette_NumPDR <- c("#bfbfbf", "#d3f2a3", "#97e196", "#4c9b82", "#105965", "#074050")
+
+tm_shape(LargePDR_sf_summarise) +
+    tm_polygons("n",
+        breaks=Breaks_NumPDR,
+        labels=Labels_NumPDR,
+        palette=Palette_NumPDR,
+        border.col = "#ECEFF1",
+        border.alpha = 0.2,
+        style="fixed",
+        midpoint=NA,
+        popup.vars=c("msoa11nm", "density"),
+        title="Number of large PDR developments in each MSOA") + 
+  tm_legend(show=TRUE) +
+  #tm_layout(legend.only = TRUE) +
+tm_shape(LondonBorough) +
+  tm_polygons(col=NA,
+              alpha = 0,
+              border.col = "#434343",
+              border.alpha = 0.8,
+              zindex = 2)
+
+```
+Use the same breaks to have an accurate comparison of the difference in values.
+
+```{r SWM_for_Moran's_I}
+
+# generate centroids for each MSOA
+centroidMSOA <- SmallPDR_sf_summarise %>%
+  st_centroid() %>%
+  st_geometry()
+
+plot(centroidMSOA, axes=TRUE)
+
+# queens case neighbours
+MSOA_nb <- SmallPDR_sf_summarise %>%
+  poly2nb(., queen=T)
+
+summary(MSOA_nb)
+
+plot(MSOA_nb, st_geometry(centroidMSOA), col="blue")
+plot(SmallPDR_sf_summarise$geometry, add=T)
+plot(LargePDR_sf_summarise$geometry, add=T)
+
+# create a global spatial weights matrix for global Moran's I first
+MSOA.lw <- MSOA_nb %>%
+  nb2listw(., style="C")
+
+```
+
+```{r global_Moran's_I}
+
+# Global Moran's I analysis - SMALL PDR developments
+MIGlobal_SMALL <- SmallPDR_sf_summarise %>%
+  pull(n) %>%
+  as.vector() %>%
+  moran.test(.,MSOA.lw)
+
+MIGlobal_SMALL
+
+# Global Moran's I analysis - LARGE PDR developments
+MIGlobal_Large <- LargePDR_sf_summarise %>%
+  pull(n) %>%
+  as.vector() %>%
+  moran.test(.,MSOA.lw)
+
+MIGlobal_Large
+
+```
+
+```{r Local_Moran's_I}
+
+# SMALL PDR developments
+# use localmoran function to generate individual Moran's I for each ward in London - PDR Applications
+
+MILocal_SMALL <- SmallPDR_sf_summarise %>%
+  pull(n) %>%
+  as.vector %>%
+  localmoran(.,MSOA.lw) %>%
+  as_tibble()
+
+# import the data into main PDR file
+SmallPDR_sf_summarise <- SmallPDR_sf_summarise %>%
+  mutate(PDR_count_I = as.numeric(MILocal_SMALL$Ii)) %>%
+  mutate(PDR_count_Iz = as.numeric(MILocal_SMALL$Z.Ii)) # check the difference between I and Iz
+
+# plot the local Moran's I for PDR count
+# set beaks
+Breaks_MILocal <- c(-1000, -2.58, -1.96, -1.65, 1.65, 1.96, 2.58, 1000)
+
+# select colors
+Colors_MILocal <- c("#155f79", "#73a6b9", "#c4e1ec", "#bfbfbf", "#e9b386", "#cf744d", "#b24525")
+
+# plot
+tmap_mode("plot")
+
+tm_shape(SmallPDR_sf_summarise) +
+  tm_polygons("PDR_count_Iz",
+              style = "fixed",
+              breaks = Breaks_MILocal,
+              palette = Colors_MILocal,
+              midpoint = NA,
+              border.col = "#ECEFF1",
+              border.alpha = 0.2,
+              title = "Local Moran's I (Z-score), small PDR developments") +
+  tm_legend(show=TRUE)  +
+  #tm_layout(legend.only = TRUE) +
+tm_shape(LondonBorough) +
+  tm_polygons(col=NA,
+              alpha = 0,
+              border.col = "#434343",
+              border.alpha = 0.8,
+              zindex = 2)
+
+  
+  
+# LARGE PDR developments
+# use localmoran function to generate individual Moran's I for each ward in London - PDR Applications
+
+MILocal_LARGE <- LargePDR_sf_summarise %>%
+  pull(n) %>%
+  as.vector %>%
+  localmoran(.,MSOA.lw) %>%
+  as_tibble()
+
+# import the data into main PDR file
+LargePDR_sf_summarise <- LargePDR_sf_summarise %>%
+  mutate(PDR_count_I = as.numeric(MILocal_LARGE$Ii)) %>%
+  mutate(PDR_count_Iz = as.numeric(MILocal_LARGE$Z.Ii)) # check the difference between I and Iz
+
+# plot the local Moran's I for PDR count
+# set beaks
+Breaks_MILocal <- c(-1000, -2.58, -1.96, -1.65, 1.65, 1.96, 2.58, 1000)
+
+# select colors
+Colors_MILocal <- c("#155f79", "#73a6b9", "#c4e1ec", "#bfbfbf", "#e9b386", "#cf744d", "#b24525")
+
+# plot
+tmap_mode("plot")
+
+tm_shape(LargePDR_sf_summarise) +
+  tm_polygons("PDR_count_Iz",
+              style = "fixed",
+              breaks = Breaks_MILocal,
+              palette = Colors_MILocal,
+              midpoint = NA,
+              border.col = "#ECEFF1",
+              border.alpha = 0.2,
+              title = "Local Moran's I (Z-score), large PDR developments") +
+  tm_legend(show=TRUE) +
+  #tm_layout(legend.only = TRUE) +
+tm_shape(LondonBorough) +
+  tm_polygons(col=NA,
+              alpha = 0,
+              border.col = "#434343",
+              border.alpha = 0.8,
+              zindex = 2)
+
+```
+For Large PDR development - explain a trend thats been studied. Large developments concentrated in town centre. Surroundings don't really see PDR development. Hence you have an MSOA of high values surrounded by many low value ones - explaining the grey color.
+
+Small PDR development - interesting results. Clustering in south west London even more pronounced now!
+
+```{r Getis_Ord}
+
+# for small pdr developments
+GiLocal_SMALL <- SmallPDR_sf_summarise %>%
+  pull(n) %>%
+  as.vector() %>%
+  localG(., MSOA.lw)
+
+SmallPDR_sf_summarise <- SmallPDR_sf_summarise %>%
+  mutate(density_G = as.numeric(GiLocal_SMALL))
+
+tm_shape(SmallPDR_sf_summarise) +
+  tm_polygons("density_G",
+              style = "fixed",
+              breaks = Breaks_MILocal,
+              palette = Colors_MILocal,
+              midpoint = NA,
+              border.col = "#ECEFF1",
+              border.alpha = 0.2,
+              title = "Local Getis-Ord, small PDR developments") +
+  tm_legend(show=TRUE)  +
+  #tm_layout(legend.only = TRUE) +
+tm_shape(LondonBorough) +
+  tm_polygons(col=NA,
+              alpha = 0,
+              border.col = "#434343",
+              border.alpha = 0.8,
+              zindex = 2)
+
+
+# for large pdr developments
+GiLocal_LARGE <- LargePDR_sf_summarise %>%
+  pull(n) %>%
+  as.vector() %>%
+  localG(., MSOA.lw)
+
+LargePDR_sf_summarise <- LargePDR_sf_summarise %>%
+  mutate(density_G = as.numeric(GiLocal_LARGE))
+
+tm_shape(LargePDR_sf_summarise) +
+  tm_polygons("density_G",
+              style = "fixed",
+              breaks = Breaks_MILocal,
+              palette = Colors_MILocal,
+              midpoint = NA,
+              border.col = "#ECEFF1",
+              border.alpha = 0.2,
+              title = "Local Getis-Ord, large PDR developments") +
+  tm_legend(show=TRUE)  +
+  #tm_layout(legend.only = TRUE) +
+tm_shape(LondonBorough) +
+  tm_polygons(col=NA,
+              alpha = 0,
+              border.col = "#434343",
+              border.alpha = 0.8,
+              zindex = 2)
+
+```
+
+# Part V: Spatial correltation between PDR developments and other variables
+
+```{r read_variable_data}
+
+VariableData <- read_csv(here::here("Data",
+                                    "msoa-data.csv"),
+                         na=c("NA", "n/a"),
+                         locale=locale(encoding = "latin1")) %>%
+  clean_names() 
+
+#check datatype and variable class
+DTLVariableData <- VariableData %>%
+  summarise_all(class) %>%
+  pivot_longer(everything(),
+               names_to = "all_variables",
+               values_to = "variable_class")
+
+DTLVariableData
+
+#select relevant variables
+VariableData <- VariableData %>%
+  dplyr::select(middle_super_output_area,
+                msoa_name,
+                house_prices_median_house_price_2013_p,
+                population_density_persons_per_hectare_2012,
+                household_composition_2011_percentages_one_person_household,
+                household_composition_2011_percentages_couple_household_without_dependent_children,
+                qualifications_2011_census_highest_level_of_qualification_level_4_qualifications_and_above,
+                tenure_2011_social_rented_percent) %>%
+  head(., -1) %>%
+  dplyr::rename(median_hse_price2013 = house_prices_median_house_price_2013_p) %>%
+  dplyr::rename(popDen = population_density_persons_per_hectare_2012) %>%
+  dplyr::mutate(smallHouseholds=household_composition_2011_percentages_one_person_household+
+                  household_composition_2011_percentages_couple_household_without_dependent_children) %>%
+  dplyr::select(middle_super_output_area,
+                median_hse_price2013,
+                popDen,
+                smallHouseholds)
+
+```
+
+```{r Bivariate_MI_small_PDR}
+
+BivariateMIData_SMALL <- SmallPDR_sf_summarise %>%
+  as.data.frame() %>%
+  left_join(.,
+            VariableData,
+            by = c("msoa11cd"="middle_super_output_area"))
+
+# PDR LOCATIONS VS PRICE
+# extract necessary data
+x <- BivariateMIData_SMALL$n
+y <- BivariateMIData_SMALL$median_hse_price2013
+
+moran_I <- function(x, y = NULL, W){
+        if(is.null(y)) y = x
+
+        xp <- (x - mean(x, na.rm=T))/sd(x, na.rm=T)
+        yp <- (y - mean(y, na.rm=T))/sd(y, na.rm=T)
+        W[which(is.na(W))] <- 0
+        n <- nrow(W)
+
+        global <- (xp%*%W%*%yp)/(n - 1)
+        local  <- (xp*W%*%yp)
+
+        list(global = global, local  = as.numeric(local))
+}
+
+
+# Permutations for the Bivariate Moran's I
+simula_moran <- function(x, y = NULL, W, nsims = 1000){
+
+        if(is.null(y)) y = x
+
+        n   = nrow(W)
+        IDs = 1:n
+
+        xp <- (x - mean(x, na.rm=T))/sd(x, na.rm=T)
+        W[which(is.na(W))] <- 0
+
+        global_sims = NULL
+        local_sims  = matrix(NA, nrow = n, ncol=nsims)
+
+        ID_sample = sample(IDs, size = n*nsims, replace = T)
+
+        y_s = y[ID_sample]
+        y_s = matrix(y_s, nrow = n, ncol = nsims)
+        y_s <- (y_s - apply(y_s, 1, mean))/apply(y_s, 1, sd)
+
+        global_sims  <- as.numeric( (xp%*%W%*%y_s)/(n - 1) )
+        local_sims  <- (xp*W%*%y_s)
+
+        list(global_sims = global_sims,
+             local_sims  = local_sims)
+}
+
+
+#======================================================
+# Adjacency Matrix (Queen)
+
+nb <- poly2nb(LondonMSOA)
+lw <- nb2listw(nb, style = "B", zero.policy = T)
+W  <- as(lw, "symmetricMatrix")
+W  <- as.matrix(W/rowSums(W))
+W[which(is.na(W))] <- 0
+
+#======================================================
+# Calculating the index and its simulated distribution
+# for global and local values
+
+m   <- moran_I(x, y, W)
+m[[1]] # global value
+
+m_i <- m[[2]]  # local values
+
+local_sims <- simula_moran(x, y, W)$local_sims
+
+# Identifying the significant values 
+alpha <- .05  # for a 95% confidence interval
+probs <- c(alpha/2, 1-alpha/2)
+intervals <- t( apply(local_sims, 1, function(x) quantile(x, probs=probs)))
+sig        <- ( m_i < intervals[,1] )  | ( m_i > intervals[,2] )
+
+#======================================================
+# Preparing for plotting
+
+BivariateMIData_SMALL     <- st_as_sf(BivariateMIData_SMALL)
+BivariateMIData_SMALL$sigPDRvPrice <- sig
+
+
+# Identifying the LISA patterns
+xp <- (x-mean(x))/sd(x)
+yp <- (y-mean(y))/sd(y)
+
+patterns <- as.character( interaction(xp > 0, W%*%yp > 0) ) 
+patterns <- patterns %>% 
+        str_replace_all("TRUE","High") %>% 
+        str_replace_all("FALSE","Low")
+patterns[BivariateMIData_SMALL$sigPDRvPrice==0] <- "Not significant"
+BivariateMIData_SMALL$patternsPDRvPrice <- patterns
+
+################################################################################################################################################################################################
+
+# PDR LOCATIONS VS POPDEN
+# extract necessary data
+x <- BivariateMIData_SMALL$n
+y <- BivariateMIData_SMALL$popDen
+
+moran_I <- function(x, y = NULL, W){
+        if(is.null(y)) y = x
+
+        xp <- (x - mean(x, na.rm=T))/sd(x, na.rm=T)
+        yp <- (y - mean(y, na.rm=T))/sd(y, na.rm=T)
+        W[which(is.na(W))] <- 0
+        n <- nrow(W)
+
+        global <- (xp%*%W%*%yp)/(n - 1)
+        local  <- (xp*W%*%yp)
+
+        list(global = global, local  = as.numeric(local))
+}
+
+
+# Permutations for the Bivariate Moran's I
+simula_moran <- function(x, y = NULL, W, nsims = 1000){
+
+        if(is.null(y)) y = x
+
+        n   = nrow(W)
+        IDs = 1:n
+
+        xp <- (x - mean(x, na.rm=T))/sd(x, na.rm=T)
+        W[which(is.na(W))] <- 0
+
+        global_sims = NULL
+        local_sims  = matrix(NA, nrow = n, ncol=nsims)
+
+        ID_sample = sample(IDs, size = n*nsims, replace = T)
+
+        y_s = y[ID_sample]
+        y_s = matrix(y_s, nrow = n, ncol = nsims)
+        y_s <- (y_s - apply(y_s, 1, mean))/apply(y_s, 1, sd)
+
+        global_sims  <- as.numeric( (xp%*%W%*%y_s)/(n - 1) )
+        local_sims  <- (xp*W%*%y_s)
+
+        list(global_sims = global_sims,
+             local_sims  = local_sims)
+}
+
+
+#======================================================
+# Adjacency Matrix (Queen)
+
+nb <- poly2nb(BivariateMIData_SMALL)
+lw <- nb2listw(nb, style = "B", zero.policy = T)
+W  <- as(lw, "symmetricMatrix")
+W  <- as.matrix(W/rowSums(W))
+W[which(is.na(W))] <- 0
+
+#======================================================
+# Calculating the index and its simulated distribution
+# for global and local values
+
+m   <- moran_I(x, y, W)
+m[[1]] # global value
+
+m_i <- m[[2]]  # local values
+
+local_sims <- simula_moran(x, y, W)$local_sims
+
+# Identifying the significant values 
+alpha <- .05  # for a 95% confidence interval
+probs <- c(alpha/2, 1-alpha/2)
+intervals <- t( apply(local_sims, 1, function(x) quantile(x, probs=probs)))
+sig        <- ( m_i < intervals[,1] )  | ( m_i > intervals[,2] )
+
+#======================================================
+# Preparing for plotting
+
+BivariateMIData_SMALL     <- st_as_sf(BivariateMIData_SMALL)
+BivariateMIData_SMALL$sigPDRvpopD <- sig
+
+
+# Identifying the LISA patterns
+xp <- (x-mean(x))/sd(x)
+yp <- (y-mean(y))/sd(y)
+
+patterns <- as.character( interaction(xp > 0, W%*%yp > 0) ) 
+patterns <- patterns %>% 
+        str_replace_all("TRUE","High") %>% 
+        str_replace_all("FALSE","Low")
+patterns[BivariateMIData_SMALL$sigPDRvpopD==0] <- "Not significant"
+BivariateMIData_SMALL$patternsPDRvpopD <- patterns
+
+################################################################################################################################################################################################
+
+# PDR LOCATIONS VS SMALL HOUSEHOLDS
+# extract necessary data
+x <- BivariateMIData_SMALL$n
+y <- BivariateMIData_SMALL$smallHouseholds
+
+moran_I <- function(x, y = NULL, W){
+        if(is.null(y)) y = x
+
+        xp <- (x - mean(x, na.rm=T))/sd(x, na.rm=T)
+        yp <- (y - mean(y, na.rm=T))/sd(y, na.rm=T)
+        W[which(is.na(W))] <- 0
+        n <- nrow(W)
+
+        global <- (xp%*%W%*%yp)/(n - 1)
+        local  <- (xp*W%*%yp)
+
+        list(global = global, local  = as.numeric(local))
+}
+
+
+# Permutations for the Bivariate Moran's I
+simula_moran <- function(x, y = NULL, W, nsims = 1000){
+
+        if(is.null(y)) y = x
+
+        n   = nrow(W)
+        IDs = 1:n
+
+        xp <- (x - mean(x, na.rm=T))/sd(x, na.rm=T)
+        W[which(is.na(W))] <- 0
+
+        global_sims = NULL
+        local_sims  = matrix(NA, nrow = n, ncol=nsims)
+
+        ID_sample = sample(IDs, size = n*nsims, replace = T)
+
+        y_s = y[ID_sample]
+        y_s = matrix(y_s, nrow = n, ncol = nsims)
+        y_s <- (y_s - apply(y_s, 1, mean))/apply(y_s, 1, sd)
+
+        global_sims  <- as.numeric( (xp%*%W%*%y_s)/(n - 1) )
+        local_sims  <- (xp*W%*%y_s)
+
+        list(global_sims = global_sims,
+             local_sims  = local_sims)
+}
+
+
+#======================================================
+# Adjacency Matrix (Queen)
+
+nb <- poly2nb(BivariateMIData_SMALL)
+lw <- nb2listw(nb, style = "B", zero.policy = T)
+W  <- as(lw, "symmetricMatrix")
+W  <- as.matrix(W/rowSums(W))
+W[which(is.na(W))] <- 0
+
+#======================================================
+# Calculating the index and its simulated distribution
+# for global and local values
+
+m   <- moran_I(x, y, W)
+m[[1]] # global value
+
+m_i <- m[[2]]  # local values
+
+local_sims <- simula_moran(x, y, W)$local_sims
+
+# Identifying the significant values 
+alpha <- .05  # for a 95% confidence interval
+probs <- c(alpha/2, 1-alpha/2)
+intervals <- t( apply(local_sims, 1, function(x) quantile(x, probs=probs)))
+sig        <- ( m_i < intervals[,1] )  | ( m_i > intervals[,2] )
+
+#======================================================
+# Preparing for plotting
+
+BivariateMIData_SMALL     <- st_as_sf(BivariateMIData_SMALL)
+BivariateMIData_SMALL$sigPDRvHh <- sig
+
+
+# Identifying the LISA patterns
+xp <- (x-mean(x))/sd(x)
+yp <- (y-mean(y))/sd(y)
+
+patterns <- as.character( interaction(xp > 0, W%*%yp > 0) ) 
+patterns <- patterns %>% 
+        str_replace_all("TRUE","High") %>% 
+        str_replace_all("FALSE","Low")
+patterns[BivariateMIData_SMALL$sigPDRvHh==0] <- "Not significant"
+BivariateMIData_SMALL$patternsPDRvHh <- patterns
+
+
+
+# Plotting
+ggplot() + geom_sf(data=BivariateMIData_SMALL, aes(fill=patternsPDRvpopD), color="NA") +
+         scale_fill_manual(values = c("#b24525", "#e9b386", "#c4e1ec", "#155f79", "#bfbfbf")) +
+  geom_sf(data=LondonBorough, colour = "#434343", fill = "NA", size = 0.2)
+
+# Plotting
+ggplot() + geom_sf(data=BivariateMIData_SMALL, aes(fill=patternsPDRvPrice), color="NA") +
+         scale_fill_manual(values = c("#b24525", "#e9b386", "#c4e1ec", "#155f79", "#bfbfbf")) +
+  geom_sf(data=LondonBorough, colour = "#434343", fill = "NA", size = 0.2)
+
+# Plotting
+ggplot() + geom_sf(data=BivariateMIData_SMALL, aes(fill=patternsPDRvHh), color="NA") +
+         scale_fill_manual(values = c("#b24525", "#e9b386", "#c4e1ec", "#155f79", "#bfbfbf")) +
+  geom_sf(data=LondonBorough, colour = "#434343", fill = "NA", size = 0.2)
+
+```
+PDRvPrice - Discounting the Croydon cluster, small PDR developments tend to be either high-high, low-low. Few high-low clusters, indicating that small PDR developments tend to be clustered around areas with high property value.
+
+
+```{r Bivariate_MI_big_PDR}
+
+BivariateMIData_LARGE <- LargePDR_sf_summarise %>%
+  as.data.frame() %>%
+  left_join(.,
+            VariableData,
+            by = c("msoa11cd"="middle_super_output_area"))
+
+# PDR LOCATIONS VS PRICE
+# extract necessary data
+x <- BivariateMIData_LARGE$n
+y <- BivariateMIData_LARGE$median_hse_price2013
+
+moran_I <- function(x, y = NULL, W){
+        if(is.null(y)) y = x
+
+        xp <- (x - mean(x, na.rm=T))/sd(x, na.rm=T)
+        yp <- (y - mean(y, na.rm=T))/sd(y, na.rm=T)
+        W[which(is.na(W))] <- 0
+        n <- nrow(W)
+
+        global <- (xp%*%W%*%yp)/(n - 1)
+        local  <- (xp*W%*%yp)
+
+        list(global = global, local  = as.numeric(local))
+}
+
+
+# Permutations for the Bivariate Moran's I
+simula_moran <- function(x, y = NULL, W, nsims = 1000){
+
+        if(is.null(y)) y = x
+
+        n   = nrow(W)
+        IDs = 1:n
+
+        xp <- (x - mean(x, na.rm=T))/sd(x, na.rm=T)
+        W[which(is.na(W))] <- 0
+
+        global_sims = NULL
+        local_sims  = matrix(NA, nrow = n, ncol=nsims)
+
+        ID_sample = sample(IDs, size = n*nsims, replace = T)
+
+        y_s = y[ID_sample]
+        y_s = matrix(y_s, nrow = n, ncol = nsims)
+        y_s <- (y_s - apply(y_s, 1, mean))/apply(y_s, 1, sd)
+
+        global_sims  <- as.numeric( (xp%*%W%*%y_s)/(n - 1) )
+        local_sims  <- (xp*W%*%y_s)
+
+        list(global_sims = global_sims,
+             local_sims  = local_sims)
+}
+
+
+#======================================================
+# Adjacency Matrix (Queen)
+
+nb <- poly2nb(LondonMSOA)
+lw <- nb2listw(nb, style = "B", zero.policy = T)
+W  <- as(lw, "symmetricMatrix")
+W  <- as.matrix(W/rowSums(W))
+W[which(is.na(W))] <- 0
+
+#======================================================
+# Calculating the index and its simulated distribution
+# for global and local values
+
+m   <- moran_I(x, y, W)
+m[[1]] # global value
+
+m_i <- m[[2]]  # local values
+
+local_sims <- simula_moran(x, y, W)$local_sims
+
+# Identifying the significant values 
+alpha <- .05  # for a 95% confidence interval
+probs <- c(alpha/2, 1-alpha/2)
+intervals <- t( apply(local_sims, 1, function(x) quantile(x, probs=probs)))
+sig        <- ( m_i < intervals[,1] )  | ( m_i > intervals[,2] )
+
+#======================================================
+# Preparing for plotting
+
+BivariateMIData_LARGE     <- st_as_sf(BivariateMIData_LARGE)
+BivariateMIData_LARGE$sigPDRvPrice <- sig
+
+
+# Identifying the LISA patterns
+xp <- (x-mean(x))/sd(x)
+yp <- (y-mean(y))/sd(y)
+
+patterns <- as.character( interaction(xp > 0, W%*%yp > 0) ) 
+patterns <- patterns %>% 
+        str_replace_all("TRUE","High") %>% 
+        str_replace_all("FALSE","Low")
+patterns[BivariateMIData_LARGE$sigPDRvPrice==0] <- "Not significant"
+BivariateMIData_LARGE$patternsPDRvPrice <- patterns
+
+##############################################################################################################################################################################################
+
+# PDR LOCATIONS VS POPDEN
+# extract necessary data
+x <- BivariateMIData_LARGE$n
+y <- BivariateMIData_LARGE$popDen
+
+moran_I <- function(x, y = NULL, W){
+        if(is.null(y)) y = x
+
+        xp <- (x - mean(x, na.rm=T))/sd(x, na.rm=T)
+        yp <- (y - mean(y, na.rm=T))/sd(y, na.rm=T)
+        W[which(is.na(W))] <- 0
+        n <- nrow(W)
+
+        global <- (xp%*%W%*%yp)/(n - 1)
+        local  <- (xp*W%*%yp)
+
+        list(global = global, local  = as.numeric(local))
+}
+
+
+# Permutations for the Bivariate Moran's I
+simula_moran <- function(x, y = NULL, W, nsims = 1000){
+
+        if(is.null(y)) y = x
+
+        n   = nrow(W)
+        IDs = 1:n
+
+        xp <- (x - mean(x, na.rm=T))/sd(x, na.rm=T)
+        W[which(is.na(W))] <- 0
+
+        global_sims = NULL
+        local_sims  = matrix(NA, nrow = n, ncol=nsims)
+
+        ID_sample = sample(IDs, size = n*nsims, replace = T)
+
+        y_s = y[ID_sample]
+        y_s = matrix(y_s, nrow = n, ncol = nsims)
+        y_s <- (y_s - apply(y_s, 1, mean))/apply(y_s, 1, sd)
+
+        global_sims  <- as.numeric( (xp%*%W%*%y_s)/(n - 1) )
+        local_sims  <- (xp*W%*%y_s)
+
+        list(global_sims = global_sims,
+             local_sims  = local_sims)
+}
+
+
+#======================================================
+# Adjacency Matrix (Queen)
+
+nb <- poly2nb(BivariateMIData_LARGE)
+lw <- nb2listw(nb, style = "B", zero.policy = T)
+W  <- as(lw, "symmetricMatrix")
+W  <- as.matrix(W/rowSums(W))
+W[which(is.na(W))] <- 0
+
+#======================================================
+# Calculating the index and its simulated distribution
+# for global and local values
+
+m   <- moran_I(x, y, W)
+m[[1]] # global value
+
+m_i <- m[[2]]  # local values
+
+local_sims <- simula_moran(x, y, W)$local_sims
+
+# Identifying the significant values 
+alpha <- .05  # for a 95% confidence interval
+probs <- c(alpha/2, 1-alpha/2)
+intervals <- t( apply(local_sims, 1, function(x) quantile(x, probs=probs)))
+sig        <- ( m_i < intervals[,1] )  | ( m_i > intervals[,2] )
+
+#======================================================
+# Preparing for plotting
+
+BivariateMIData_LARGE     <- st_as_sf(BivariateMIData_LARGE)
+BivariateMIData_LARGE$sigPDRvpopD <- sig
+
+
+# Identifying the LISA patterns
+xp <- (x-mean(x))/sd(x)
+yp <- (y-mean(y))/sd(y)
+
+patterns <- as.character( interaction(xp > 0, W%*%yp > 0) ) 
+patterns <- patterns %>% 
+        str_replace_all("TRUE","High") %>% 
+        str_replace_all("FALSE","Low")
+patterns[BivariateMIData_LARGE$sigPDRvpopD==0] <- "Not significant"
+BivariateMIData_LARGE$patternsPDRvpopD <- patterns
+
+################################################################################################################################################################################################
+
+# PDR LOCATIONS VS SMALL HOUSEHOLDS
+# extract necessary data
+x <- BivariateMIData_LARGE$n
+y <- BivariateMIData_LARGE$smallHouseholds
+
+moran_I <- function(x, y = NULL, W){
+        if(is.null(y)) y = x
+
+        xp <- (x - mean(x, na.rm=T))/sd(x, na.rm=T)
+        yp <- (y - mean(y, na.rm=T))/sd(y, na.rm=T)
+        W[which(is.na(W))] <- 0
+        n <- nrow(W)
+
+        global <- (xp%*%W%*%yp)/(n - 1)
+        local  <- (xp*W%*%yp)
+
+        list(global = global, local  = as.numeric(local))
+}
+
+
+# Permutations for the Bivariate Moran's I
+simula_moran <- function(x, y = NULL, W, nsims = 1000){
+
+        if(is.null(y)) y = x
+
+        n   = nrow(W)
+        IDs = 1:n
+
+        xp <- (x - mean(x, na.rm=T))/sd(x, na.rm=T)
+        W[which(is.na(W))] <- 0
+
+        global_sims = NULL
+        local_sims  = matrix(NA, nrow = n, ncol=nsims)
+
+        ID_sample = sample(IDs, size = n*nsims, replace = T)
+
+        y_s = y[ID_sample]
+        y_s = matrix(y_s, nrow = n, ncol = nsims)
+        y_s <- (y_s - apply(y_s, 1, mean))/apply(y_s, 1, sd)
+
+        global_sims  <- as.numeric( (xp%*%W%*%y_s)/(n - 1) )
+        local_sims  <- (xp*W%*%y_s)
+
+        list(global_sims = global_sims,
+             local_sims  = local_sims)
+}
+
+
+#======================================================
+# Adjacency Matrix (Queen)
+
+nb <- poly2nb(BivariateMIData_LARGE)
+lw <- nb2listw(nb, style = "B", zero.policy = T)
+W  <- as(lw, "symmetricMatrix")
+W  <- as.matrix(W/rowSums(W))
+W[which(is.na(W))] <- 0
+
+#======================================================
+# Calculating the index and its simulated distribution
+# for global and local values
+
+m   <- moran_I(x, y, W)
+m[[1]] # global value
+
+m_i <- m[[2]]  # local values
+
+local_sims <- simula_moran(x, y, W)$local_sims
+
+# Identifying the significant values 
+alpha <- .05  # for a 95% confidence interval
+probs <- c(alpha/2, 1-alpha/2)
+intervals <- t( apply(local_sims, 1, function(x) quantile(x, probs=probs)))
+sig        <- ( m_i < intervals[,1] )  | ( m_i > intervals[,2] )
+
+#======================================================
+# Preparing for plotting
+
+BivariateMIData_LARGE     <- st_as_sf(BivariateMIData_LARGE)
+BivariateMIData_LARGE$sigPDRvHh <- sig
+
+
+# Identifying the LISA patterns
+xp <- (x-mean(x))/sd(x)
+yp <- (y-mean(y))/sd(y)
+
+patterns <- as.character( interaction(xp > 0, W%*%yp > 0) ) 
+patterns <- patterns %>% 
+        str_replace_all("TRUE","High") %>% 
+        str_replace_all("FALSE","Low")
+patterns[BivariateMIData_LARGE$sigPDRvHh==0] <- "Not significant"
+BivariateMIData_LARGE$patternsPDRvHh <- patterns
+
+
+
+# Plotting
+ggplot() + geom_sf(data=BivariateMIData_LARGE, aes(fill=patternsPDRvpopD), color="NA") +
+         scale_fill_manual(values = c("#b24525", "#e9b386", "#c4e1ec", "#155f79", "#bfbfbf")) +
+  geom_sf(data=LondonBorough, colour = "#434343", fill = "NA", size = 0.2)
+
+# Plotting
+ggplot() + geom_sf(data=BivariateMIData_LARGE, aes(fill=patternsPDRvPrice), color="NA") +
+         scale_fill_manual(values = c("#b24525", "#e9b386", "#c4e1ec", "#155f79", "#bfbfbf")) +
+  geom_sf(data=LondonBorough, colour = "#434343", fill = "NA", size = 0.2)
+
+# Plotting
+ggplot() + geom_sf(data=BivariateMIData_LARGE, aes(fill=patternsPDRvHh), color="NA") +
+        scale_fill_manual(values = c("#b24525", "#e9b386", "#c4e1ec", "#155f79", "#bfbfbf")) +
+  geom_sf(data=LondonBorough, colour = "#434343", fill = "NA", size = 0.2)
+
+```
+
+
+# Part VI: Locational Attributes of PDR developments
+
+### Buffer analysis for London stations
+
+```{r London_train_station_data_and_buffers}
+
+# Read in data of all London stations
+
+LondonStations <- read_csv(here::here("Data", "LondonStations.csv"),
+  na = c("NA", "n/a"),
+  locale = locale(encoding="latin1")) %>%
+  clean_names() %>%
+  dplyr::select(station,
+                os_x,
+                os_y)
+
+# Convert coordinate data into spatial point data
+
+LondonStationPoints <- LondonStations %>%
+  st_as_sf(., coords=c("os_x","os_y"),
+           crs = 27700) %>%
+  st_transform(., 27700) %>% # just in case
+  distinct(geometry, .keep_all = T)
+
+# Consider only stations within London boundaries by performing a spatial subset
+
+LondonStationsPointsSub <- LondonStationPoints[LondonMSOA,]
+
+# add 500m buffer for stations
+
+stationBuf <- st_buffer(LondonStationsPointsSub,
+                        500) %>%
+  st_union()
+
+# Preliminary Plot
+
+tm_shape(LondonMSOA) +
+  tm_polygons(col=NA, alpha=0.5) +
+tm_shape(LondonStationsPointsSub) +
+  tm_dots(col = "cyan") +
+tm_shape(stationBuf) +
+  tm_polygons(col = "gray", alpha = 0.5)
+
+```
+
+```{r small_and_large_PDR_within_station_buffer}
+
+# Just the buffer overlay and PDR points - SMALL PDR developments
+
+tm_shape(LondonMSOA) +
+  tm_polygons(col=NA, alpha=0.5) +
+tm_shape(stationBuf) +
+  tm_polygons(col = "#A9BCD0", alpha = 0.5) +
+tm_shape(PDRPoints_SMALL) +
+  tm_dots(col = "green")
+
+# find out how many PDR developments are within 500m access of transport
+
+# Perform a spatial subset for 500m
+
+SmallPDRsWithin500m <- PDRPoints_SMALL[stationBuf,]
+
+# Now for 600m
+stationBuf600 <- st_buffer(LondonStationsPointsSub,
+                        600) %>%
+  st_union()
+
+SmallPDRsWithin600m <- PDRPoints_SMALL[stationBuf600,]
+
+# 700m
+stationBuf700 <- st_buffer(LondonStationsPointsSub,
+                        700) %>%
+  st_union()
+
+SmallPDRsWithin700m <- PDRPoints_SMALL[stationBuf700,]
+
+# 800m
+stationBuf800 <- st_buffer(LondonStationsPointsSub,
+                        800) %>%
+  st_union()
+
+SmallPDRsWithin800m <- PDRPoints_SMALL[stationBuf800,]
+
+# 900m
+stationBuf900 <- st_buffer(LondonStationsPointsSub,
+                        900) %>%
+  st_union()
+
+SmallPDRsWithin900m <- PDRPoints_SMALL[stationBuf900,]
+
+# 1000m
+stationBuf1000 <- st_buffer(LondonStationsPointsSub,
+                        1000) %>%
+  st_union()
+
+SmallPDRsWithin1000m <- PDRPoints_SMALL[stationBuf1000,]
+
+# 1500m
+stationBuf1500 <- st_buffer(LondonStationsPointsSub,
+                        1500) %>%
+  st_union()
+
+SmallPDRsWithin1500m <- PDRPoints_SMALL[stationBuf1500,]
+
+
+# Just the buffer overlay and PDR points - LARGE PDR developments
+
+tm_shape(LondonMSOA) +
+  tm_polygons(col=NA, alpha=0.5) +
+tm_shape(stationBuf) +
+  tm_polygons(col = "#A9BCD0", alpha = 0.5) +
+tm_shape(PDRPoints_LARGE) +
+  tm_dots(col = "blue")
+
+# find out how many PDR developments are within 500m access of transport
+
+# Perform a spatial subset for 500m
+
+LargePDRsWithin500m <- PDRPoints_LARGE[stationBuf,]
+
+# Now for 600m
+
+LargePDRsWithin600m <- PDRPoints_LARGE[stationBuf600,]
+
+# 700m
+
+LargePDRsWithin700m <- PDRPoints_LARGE[stationBuf700,]
+
+# 800m
+
+LargePDRsWithin800m <- PDRPoints_LARGE[stationBuf800,]
+
+# 900m
+
+LargePDRsWithin900m <- PDRPoints_LARGE[stationBuf900,]
+
+# 1000m
+
+LargePDRsWithin1000m <- PDRPoints_LARGE[stationBuf1000,]
+
+# 1500m
+
+LargePDRsWithin1500m <- PDRPoints_LARGE[stationBuf1500,]
+```
+
+```{r create_dataframe_from_above_and_compute_pct}
+dist_station <- c("500", "600", "700", "800", "900", "1000", "1500")
+s_pdr_in_buffer <- c("1133", "1371", "1568", "1742", "1844", "1903", "2053")
+l_pdr_in_buffer <- c("259", "296", "330", "358", "370", "377", "395")
+
+PDRStationDist <- data.frame(dist_station, s_pdr_in_buffer, l_pdr_in_buffer)
+
+# calculate percentage of PDR developments that fall within each buffer
+PDRStationDist <- PDRStationDist %>%
+  transform(., dist_station = as.numeric(dist_station)) %>%
+  transform(., s_pdr_in_buffer = as.numeric(s_pdr_in_buffer)) %>%
+  transform(., l_pdr_in_buffer = as.numeric(l_pdr_in_buffer)) %>%
+  dplyr::mutate(s_pdr_in_buffer_pct=s_pdr_in_buffer/2090*100) %>%
+  dplyr::mutate(l_pdr_in_buffer_pct=l_pdr_in_buffer/414*100)
+
+# export as csv to excel for graphing
+
+write.csv(PDRStationDist, "/Users/ian/Downloads/PDRStationDist.csv" , row.names = FALSE)
+
+```
+
+```{r plot_graph}
+
+# read in data
+BufferGraph <- read_csv(here::here("Data", "PDRStationDistUpdate.csv")) %>%
+  clean_names()
+
+# Line plot with multiple groups
+BufferPlot <- ggplot(data=BufferGraph, aes(x=buffer, y=percentage, group=pdr_type)) +
+  geom_line(aes(color=pdr_type)) +
+  geom_point(aes(color=pdr_type))
+
+BufferPlot + scale_color_manual(values=c("#999999", "#E69F00"))
+
+```
+
+### NO2 pollution analysis
+
+```{r raster_pollution_data_NO2}
+
+# read in NO2 pollution data
+
+NO2Raster <- raster(here::here("Data",
+                               "ASCII",
+                               "LAEI2016_2016_NO2.asc"))
+
+plot(NO2Raster)
+
+# change crs to british national grid
+
+BNGProj <- "+init=epsg:27700"
+
+NO2Raster <- NO2Raster %>%
+  projectRaster(.,crs=BNGProj)
+
+plot(NO2Raster)
+
+# set colors and breaks
+
+NO2Cuts = c(0,16,19,22,25,28,31,34,37,40,43,46,49,52,55,58)
+NO2Pal = c("#0a274f", "#001a97", "#022dcc", "#184eea", "#4195e3", "#60cdd3",
+           "#a1fad2", "#86da8e", "#b3e869", "#fffe92", "#f8d749", "#f3b069", "#eb8231",
+           "#ea3224", "#76163f", "#39083d")
+
+plot(NO2Raster, breaks=NO2Cuts, col=NO2Pal)
+
+```
+
+```{r calculating_spatial_covariates_smallPDR}
+
+# Small PDR developments
+# Load NO2 data as pixel image
+pollution <- as.im(NO2Raster)
+
+# tesselate
+PollutionBreaks = quantile(pollution, probs = (0:20)/20)
+PollutionCut = cut(pollution, breaks = PollutionBreaks, label=1:20)
+tess = tess(image=PollutionCut)
+plot(tess)
+
+# quadrat count - tells you how many PDRs fall into highly polluted areas
+qcPDRPol_SMALL = quadratcount(PDRPointsPPP_SMALL, tess = tess)
+
+qcPDRPol_SMALL
+
+plot(qcPDRPol_SMALL, add = T)
+
+# test for statistical significance - use the quardrat test function (test for complete spatial randomness for point pattern)
+
+quadrat.test(qcPDRPol_SMALL,
+             method = "MonteCarlo",
+             nsim=1999)
+
+# BARCHART
+
+# create dataframe
+qcPDRPol_SMALLdf <- qcPDRPol_SMALL %>%
+  as.data.frame()
+
+# plot bar chart
+qcPDRPol_SMALLbc <- ggplot(qcPDRPol_SMALLdf,
+                           aes(x=tile, y=Freq)) +
+  geom_bar(stat="identity", color="#434343", fill="#434343") +
+  geom_text(aes(label=Freq), vjust=-0.3, size=3.5) +
+  theme_classic()
+
+qcPDRPol_SMALLbc
+
+```
+```{r}
+summary(qcPDRPol_SMALLdf$Freq)
+```
+
+```{r calculating_spatial_covariates_largePDR}
+# Large PDR developments
+# Load NO2 data as pixel image
+pollution <- as.im(NO2Raster)
+
+# tesselate
+PollutionBreaks = quantile(pollution, probs = (0:20)/20)
+PollutionCut = cut(pollution, breaks = PollutionBreaks, label=1:20)
+tess = tess(image=PollutionCut)
+plot(tess)
+
+# quadrat count - tells you how many PDRs fall into highly polluted areas
+qcPDRPol_LARGE = quadratcount(PDRPointsPPP_LARGE, tess = tess)
+
+qcPDRPol_LARGE
+
+plot(qcPDRPol_LARGE, add = T)
+
+# test for statistical significance - use the quardrat test function (test for complete spatial randomness for point pattern)
+
+quadrat.test(qcPDRPol_LARGE,
+             method = "MonteCarlo",
+             nsim=1999)
+
+# BARCHART
+
+# create dataframe
+qcPDRPol_LARGEdf <- qcPDRPol_LARGE %>%
+  as.data.frame()
+
+# plot bar chart
+qcPDRPol_LARGEbc <- ggplot(qcPDRPol_LARGEdf,
+                           aes(x=tile, y=Freq)) +
+  geom_bar(stat="identity", color="#434343", fill="#434343") +
+  geom_text(aes(label=Freq), vjust=-0.3, size=3.5) +
+  theme_classic()
+
+qcPDRPol_LARGEbc
+
+ggsave("qcPDRPol_LARGEbc.png", width = 9, height = 6, dpi = 300)
+```
+
+
+# Part VII: Space and quality attributes
+
+### Dataset
+
+```{r read_in_EPC_file_data}
+
+MatchedEPCRaw <- arrow::read_feather(here::here("Data", 
+                                                "matched-EPCs-and-PDRs.feather"))
+
+```
+
+```{r tidy_data}
+# total rows in dataset: 26328
+# check repeat occurrence of EPC keys
+
+n_occurLMK <- data.frame(table(MatchedEPCRaw$LMK_KEY))
+
+# disentangle same EPC Key from same address
+# total rows in dataset: 14192
+
+MatchedEPC <- MatchedEPCRaw %>%
+  dplyr::distinct(LMK_KEY, .keep_all = TRUE)
+
+# concatenate ADDRESS1 and ADDRESS2 columns
+MatchedEPC <- MatchedEPC %>%
+  tidyr::unite("ADD", ADDRESS1:ADDRESS2, remove = FALSE)
+
+# check repeat occurrence of address
+n_occurADD <- data.frame(table(MatchedEPC$ADD))
+
+#check datatype and variable class
+DTLMatchedEPC<- MatchedEPC %>%
+  summarise_all(class) %>%
+  pivot_longer(everything(),
+               names_to = "all_variables",
+               values_to = "variable_class")
+
+DTLMatchedEPC
+
+# identify duplicate rows of addresses and remove the old entries
+# total rows in dataset: 13536
+MatchedEPC <- MatchedEPC %>%
+  dplyr::group_by(ADD) %>%
+  filter(date_x == max(date_x))
+
+```
+
+```{r small_and_big_developments}
+# SMALL PDR DEVELOPMENT
+MatchedEPC_SMALL <- MatchedEPC %>%
+  dplyr::filter(residential_units_proposed<11 & residential_units_proposed>0)
+
+# create a letter 2 number function
+letter2number <- function(x) {utf8ToInt(x) - utf8ToInt("A") + 1L}
+
+# create new character column
+MatchedEPC_SMALL <- MatchedEPC_SMALL %>%
+  dplyr::mutate(ERValue = as.character(CURRENT_ENERGY_RATING))
+
+# change to numeric
+MatchedEPC_SMALL["ERValue"][MatchedEPC_SMALL["ERValue"] == "A"] <- "1"
+MatchedEPC_SMALL["ERValue"][MatchedEPC_SMALL["ERValue"] == "B"] <- "2"
+MatchedEPC_SMALL["ERValue"][MatchedEPC_SMALL["ERValue"] == "C"] <- "3"
+MatchedEPC_SMALL["ERValue"][MatchedEPC_SMALL["ERValue"] == "D"] <- "4"
+MatchedEPC_SMALL["ERValue"][MatchedEPC_SMALL["ERValue"] == "E"] <- "5"
+MatchedEPC_SMALL["ERValue"][MatchedEPC_SMALL["ERValue"] == "F"] <- "6"
+MatchedEPC_SMALL["ERValue"][MatchedEPC_SMALL["ERValue"] == "G"] <- "7"
+
+# change ERValue to integer
+MatchedEPC_SMALL <- MatchedEPC_SMALL %>%
+  dplyr::mutate(ERValueInt = as.numeric(ERValue))
+
+
+
+# LARGE PDR DEVELOPMENT
+MatchedEPC_LARGE <- MatchedEPC %>%
+  dplyr::filter(residential_units_proposed>10)
+
+# create new character column
+MatchedEPC_LARGE <- MatchedEPC_LARGE %>%
+  dplyr::mutate(ERValue = as.character(CURRENT_ENERGY_RATING))
+
+# change to numeric
+MatchedEPC_LARGE["ERValue"][MatchedEPC_LARGE["ERValue"] == "A"] <- "1"
+MatchedEPC_LARGE["ERValue"][MatchedEPC_LARGE["ERValue"] == "B"] <- "2"
+MatchedEPC_LARGE["ERValue"][MatchedEPC_LARGE["ERValue"] == "C"] <- "3"
+MatchedEPC_LARGE["ERValue"][MatchedEPC_LARGE["ERValue"] == "D"] <- "4"
+MatchedEPC_LARGE["ERValue"][MatchedEPC_LARGE["ERValue"] == "E"] <- "5"
+MatchedEPC_LARGE["ERValue"][MatchedEPC_LARGE["ERValue"] == "F"] <- "6"
+MatchedEPC_LARGE["ERValue"][MatchedEPC_LARGE["ERValue"] == "G"] <- "7"
+
+# change ERValue to integer
+MatchedEPC_LARGE <- MatchedEPC_LARGE %>%
+  dplyr::mutate(ERValueInt = as.numeric(ERValue))
+
+```
+
+```{r energy_rating}
+
+# small PDR
+
+mean(MatchedEPC_SMALL$ERValueInt)
+median(MatchedEPC_SMALL$ERValueInt)
+sd(MatchedEPC_SMALL$ERValueInt)
+
+# export for graph
+write.csv(MatchedEPC_SMALL, "/Users/ian/Downloads/MatchedEPC_SMALL.csv",
+          row.names = FALSE)
+
+# large PDR
+
+mean(MatchedEPC_LARGE$ERValueInt)
+median(MatchedEPC_LARGE$ERValueInt)
+sd(MatchedEPC_LARGE$ERValueInt)
+
+write.csv(MatchedEPC_LARGE, "/Users/ian/Downloads/MatchedEPC_LARGE.csv",
+          row.names = FALSE)
+
+
+# investigate, for small PDRs, the breakdown between retail and office
+
+MatchedEPC_SMALL_takeaway <- MatchedEPC_SMALL %>%
+  dplyr::filter(application_type_assumed == 
+                  "Prior Approval: Change of use - retail/takeaway to dwellinghouses")
+
+mean(MatchedEPC_SMALL_takeaway$ERValueInt)
+median(MatchedEPC_SMALL_takeaway$ERValueInt)
+sd(MatchedEPC_SMALL_takeaway$ERValueInt)
+
+MatchedEPC_SMALL_office <- MatchedEPC_SMALL %>%
+  dplyr::filter(application_type_assumed == 
+                  "Prior Approval: Change of use - offices to dwellinghouses")
+
+mean(MatchedEPC_SMALL_office$ERValueInt)
+median(MatchedEPC_SMALL_office$ERValueInt)
+sd(MatchedEPC_SMALL_office$ERValueInt)
+
+```
+
+```{r trial_plot}
+
+PDRER <- read_csv(here::here("Data",
+                             "EnergyRatingPDR.csv")) 
+
+
+PDRERBoxplot <- ggplot(PDRER, aes(x=Class, y=ERValueInt))+
+  geom_boxplot(fill=c("#999999", "#E69F00"), width = 0.5) 
+
+PDRERBoxplot
+
+```
+
+
+Maybe include bar chart on proportion of each rating.
+
+EPC data lower than that of new builds. But not too bad.
+
+Recent research has suggested that 84.4% of newly built properties have an Energy Performance Certificate (EPC) rating of an A or B -
+https://www.epcforyou.co.uk/2018/03/09/energy-performance-new-builds-superior/
+
+Those with G in small PDR developments comprised a lot of retail/takeaway conversions.
+
+```{r average_development_size}
+
+# small PDR developments
+MatchedEPC_SMALL_size <- MatchedEPC_SMALL %>%
+  # aggregate by planning application
+  dplyr::group_by(application_number) %>%
+  summarise(AvgUnitSize = mean(TOTAL_FLOOR_AREA))
+
+# export for graph
+write.csv(MatchedEPC_SMALL_size, "/Users/ian/Downloads/MatchedEPC_SMALL_size.csv",
+          row.names = FALSE)
+
+mean(MatchedEPC_SMALL_size$AvgUnitSize)
+median(MatchedEPC_SMALL_size$AvgUnitSize)
+sd(MatchedEPC_SMALL_size$AvgUnitSize)
+summary(MatchedEPC_SMALL_size$AvgUnitSize)
+
+ggplot(MatchedEPC_SMALL_size, aes(x=AvgUnitSize)) +
+  geom_boxplot()
+
+# observe if the same trend holds if we remove 1-2 unit conversions
+MatchedEPC_SMALL_sizeExcl1n2 <- MatchedEPC_SMALL %>%
+  dplyr::filter(residential_units_proposed>2) %>%
+  # aggregate by planning application
+  dplyr::group_by(application_number) %>%
+  summarise(AvgUnitSize = mean(TOTAL_FLOOR_AREA))
+
+# export for graph
+write.csv(MatchedEPC_SMALL_sizeExcl1n2,
+          "/Users/ian/Downloads/MatchedEPC_SMALL_sizeExcl1n2.csv",
+          row.names = FALSE)
+
+mean(MatchedEPC_SMALL_sizeExcl1n2$AvgUnitSize)
+median(MatchedEPC_SMALL_size$AvgUnitSize)
+sd(MatchedEPC_SMALL_sizeExcl1n2$AvgUnitSize)
+summary(MatchedEPC_SMALL_sizeExcl1n2$AvgUnitSize)
+
+ggplot(MatchedEPC_SMALL_sizeExcl1n2, aes(x=AvgUnitSize)) +
+  geom_boxplot()
+
+
+# large PDR developments
+MatchedEPC_LARGE_size <- MatchedEPC_LARGE %>%
+  # aggregate by planning application
+  dplyr::group_by(application_number) %>%
+  summarise(AvgUnitSize = mean(TOTAL_FLOOR_AREA))
+
+# export for graph
+write.csv(MatchedEPC_LARGE_size, "/Users/ian/Downloads/MatchedEPC_LARGE_size.csv",
+          row.names = FALSE)
+
+mean(MatchedEPC_LARGE_size$AvgUnitSize)
+median(MatchedEPC_LARGE_size$AvgUnitSize)
+sd(MatchedEPC_LARGE_size$AvgUnitSize)
+summary(MatchedEPC_LARGE_size$AvgUnitSize)
+
+ggplot(MatchedEPC_LARGE_size, aes(x=AvgUnitSize)) +
+  geom_boxplot()
+ 
+```
+
+```{r combined_BnW_plot}
+
+PDRUnitBoxplotData <- read_csv(here::here("Data",
+                                          "PDRDvpBoxplotData.csv")) 
+
+PDRUnitBoxplotData$Avg_Unit_Size_per_Dvp <- as.numeric(PDRUnitBoxplotData$Avg_Unit_Size_per_Dvp)
+
+PDRUnitBoxplot <- ggplot(PDRUnitBoxplotData, aes(x=Development_Type, y=Avg_Unit_Size_per_Dvp))+
+  geom_boxplot(fill=c("#999999", "#E69F00", "#56B4E9"), width = 0.5)+
+  ylim(0,460)
+
+PDRUnitBoxplot
+
+# inset, with limits
+PDRUnitBoxplot <- ggplot(PDRUnitBoxplotData, aes(x=Development_Type, y=Avg_Unit_Size_per_Dvp))+
+  geom_boxplot(fill=c("#999999", "#E69F00", "#56B4E9"), width = 0.5) +
+  ylim(0,125)
+  
+PDRUnitBoxplot
+
+
+ggsave("PDRUnitBoxplot.png", width = 9, height = 6, dpi = 300)
+
+```
+
+Seeing here, small PDRs tend to be larger in size compared to large PDR developments. Ignoring the extremities by looking at median and 1st/3rd quatiles tells the same story. 
+
+Removing 1 and 2 units developments that might be humongous, this trend stays the same.
+
+
+```{r glazing}
+
+# small PDR developments
+
+# create data type list
+DTLMatchedEPC_SMALL_Glaze <- MatchedEPC_SMALL %>%
+  drop_na(GLAZED_TYPE) %>%
+  dplyr::group_by(GLAZED_TYPE) %>%
+  dplyr::count(GLAZED_TYPE)
+
+# bar plot
+GlazeBPsmall <- ggplot(DTLMatchedEPC_SMALL_Glaze, aes(x="", y=n, fill=GLAZED_TYPE)) +
+  geom_bar(width = 0.2, stat = "identity")
+
+GlazeBPsmall
+
+# large PDR developments
+DTLMatchedEPC_LARGE_Glaze <- MatchedEPC_LARGE %>%
+  drop_na(GLAZED_TYPE) %>%
+  dplyr::group_by(GLAZED_TYPE) %>%
+  dplyr::count(GLAZED_TYPE)
+
+# bar plot
+GlazeBPsmall <- ggplot(DTLMatchedEPC_LARGE_Glaze, aes(x="", y=n, fill=GLAZED_TYPE)) +
+  geom_bar(width = 0.2, stat = "identity")
+
+GlazeBPsmall + scale_fill_manual(values=c("#999999", "#E69F00", "#56B4E9", "#FFFFFF"))
+
+GlazeBPsmall
+  
+```
+
+```{r combined_stacked_bar}
+ 
+# read in data
+GlazingGraph <- read_csv(here::here("Data", "GlazingChart.csv")) %>%
+  clean_names()
+
+# Line plot with multiple groups
+GlazingPlot <- ggplot(data=GlazingGraph, aes(fill=glazed_type, y=count, x=pdr_type)) +
+  geom_bar(position="fill", stat="identity", width=0.35)
+
+GlazingPlot + scale_fill_manual(values=c("#155F79", "#E69F00", "#56B4E9", "#b24525"))
+
+
+```
+
+Data insufficient. Also, there are different quality of double glazings as well. Gives us an insight but insufficient to conclude.
+
+```{r impacts_of_April2021_NDSS}
+
+PDRConversionsConsideredII <- c("Prior Approval: Change of use - offices to dwellinghouses", 
+                              "Prior Approval: Change of use - retail/takeaway to dwellinghouses", 
+                              "Prior Approval: Change of use - light industrial to dwellinghouses",
+                              "Prior Approval: Change of use - agriculture to dwellinghouses",
+                              "Prior Approval: Change of use - amusements/casinos to dwellinghouses",
+                              "Prior Approval: Change of use - retail/service/takeaway/etc to dwellinghouses",
+                              "Prior Approval: Change of use - storage to dwellinghouses",
+                              "Prior Approval: Change of use from Commercial, Business and Service (Use Class E) to Dwellinghouses (Use Class C3)")
+
+PDRStatus <- c("Allowed", "Completed", "Approved", "Commenced")
+
+PostApril2021PDR <- PDRDvpRaw %>%
+  # clean names
+  clean_names() %>%
+  # select types of conversions you want
+  dplyr::filter(application_type_on_datahub %in% PDRConversionsConsideredII) %>%
+  dplyr::filter(status %in% PDRStatus) %>%
+  dplyr::filter(decision_date > 1-Apr-2021) %>%
+  dplyr::select(id,
+                application_type_assumed,
+                development_description,
+                easting,
+                northing,
+                postcode,
+                planning_authority,
+                application_number,
+                decision_date,
+                residential_units_proposed,
+                existing_use_class_from_datahub,
+                existing_non_residential_floorspace) %>%
+  # remove entries that do not have coordinate data - this drops entries from 2645 to 2637
+  drop_na(easting)
+
+```
+Insufficient data for analysis to be done.
+
+```{r distribution_of_unit_size_small_PDR}
+SmallPDRunder35 <- MatchedEPC_SMALL %>%
+  dplyr::filter(TOTAL_FLOOR_AREA < 35)
+
+SmallPDRbtw35and40 <- MatchedEPC_SMALL %>%
+  dplyr::filter(TOTAL_FLOOR_AREA > 35 & TOTAL_FLOOR_AREA < 41)
+
+SmallPDRover40 <- MatchedEPC_SMALL %>%
+  dplyr::filter(TOTAL_FLOOR_AREA > 40)
+
+```
+
+```{r distribution_of_unit_size_large_PDR}
+
+LargePDRunder35 <- MatchedEPC_LARGE %>%
+  dplyr::filter(TOTAL_FLOOR_AREA < 35)
+
+LargePDRbtw35and40 <- MatchedEPC_LARGE %>%
+  dplyr::filter(TOTAL_FLOOR_AREA > 35 & TOTAL_FLOOR_AREA < 41)
+
+LargePDRover40 <- MatchedEPC_LARGE %>%
+  dplyr::filter(TOTAL_FLOOR_AREA > 40)
+```
+
+```{r plot_graph}
+
+# read in data
+NDSSGraph <- read_csv(here::here("Data", "PDRNDSSCompliance.csv")) %>%
+  clean_names()
+
+# Line plot with multiple groups
+NDSSGraph <- ggplot(data=NDSSGraph, aes(fill=size, y=count, x=pdr_type)) +
+  geom_bar(position="fill", stat="identity", width=0.35)
+
+NDSSGraph + scale_fill_manual(values=c("#E69F00", "#b24525", "#155F79"))
+
+ggsave("NDSSGraph.png", width = 9, height = 6, dpi = 300)
+
+```
+
